@@ -1,0 +1,229 @@
+library(readr)
+library(EnsDb.Hsapiens.v86)
+library(GenomicRanges)
+library(SummarizedExperiment)
+
+matriu <- read.csv("GSE161731_counts (1).csv.gz")
+metadata <- read_csv("GSE161731_counts_key.csv")
+
+#1
+#Etiquetar bé la matriu i les metadates
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- metadata$rna_id
+rownames(matriu) <- matriu[[1]]
+matriu <- matriu[, -1]
+
+#Igualar assay-colData
+metadata$rna_id <- gsub("-", "\\.", metadata$rna_id)
+colnames(matriu) <- sub("^X", "", colnames(matriu))
+
+setdiff(colnames(matriu), rownames(metadata))
+setdiff(rownames(metadata), colnames(matriu))
+
+matriu <- matriu[, !grepl("batch", colnames(matriu))]
+
+#Igualar assay-rowRanges
+gens_matriu <- rownames(matriu)
+gens_total <- genes(EnsDb.Hsapiens.v86)
+
+gens_comuns <- intersect(gens_matriu, names(gens_total))
+
+matriu_ <- matriu[gens_comuns, ]
+rowRanges <- gens_total[gens_comuns]
+
+#Construir se
+se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(matriu_)), 
+  colData = metadata,
+  rowRanges = rowRanges
+)
+
+identical(rownames(matriu_), names(gens_total[gens_comuns]))
+head(rownames(matriu_))
+head(names(rowRanges))
+
+#2
+#Seleccionar cohorts
+cohorts <- colData(se)$cohort %in% c("COVID-19", "Bacterial", "healthy")
+se_cohorts <- se[, cohorts]
+
+#Eliminar individus duplicats
+individus <- !duplicated(rownames(colData(se_cohorts)))
+se_individus <- se_cohorts[, individus]
+
+#Tipus de variables
+sapply(colData(se_cohorts), class)
+colData(se_individus)$age <- gsub(">89", "90", colData(se_individus)$age)
+colData(se_individus)$age <- as.numeric(colData(se_individus)$age)
+
+#Subtituir per "_"
+colData(se_individus)$race <- gsub(" ", "_", colData(se_individus)$race)
+colData(se_individus)$race <- gsub("/", "_", colData(se_individus)$race)
+colData(se_individus)$cohort <- gsub("-", "_", colData(se_individus)$cohort)
+
+#Llavor amb 75 mostres
+myseed <- sum(utf8ToInt("mariateresacasasnovasriudavets"))
+set.seed(myseed)
+
+mostres <- sample(nrow(colData(se_individus)), 75)
+se_mostres <- se_individus[, mostres]
+
+#3
+#FILTRATGE
+library(edgeR)
+#Calcular CPM (Counts per Million)
+counts.CPM <- cpm(assay(se_mostres, "counts"))
+head(counts.CPM)
+#Matriu amb CPM > 0.5
+thresh <- counts.CPM > 0.5
+head(thresh)
+#Selecció >= 2 CPM > 0.5
+keep <- rowSums(thresh) >= 2
+#Incorporació a se
+counts.keep <- (assay(se_mostres, "counts"))[keep,]
+#Calcular dimencions
+dim((assay(se_mostres, "counts")))
+dim(counts.keep)
+#S'ha passat de 57602 a 24496
+
+#NORMALITZACIÓ
+#Crear DGEList
+dgeObj <- DGEList(counts.keep)
+dgeObj
+names(dgeObj)
+dgeObj$samples
+#Fer el log de CPM
+logcounts <- cpm(dgeObj,log=TRUE)
+#Visalització de la distribució abans de la normalització
+boxplot(logcounts, ylab="Log2-CPM",las=2, xlab="", cex.axis=0.8, main="Boxplots of logCPMs (unnormalised)", cex.main=0.8)
+abline(h=median(logcounts), col="blue")
+#Normalització
+dgeObj_norm <- calcNormFactors(dgeObj)
+dgeObj_norm
+#Fer el log de les dades normalitzades
+logcounts_norm <- cpm(dgeObj_norm,log=TRUE)
+#Visalització de la distribució després de la normalització
+boxplot(logcounts_norm, ylab="Log2-CPM",las=2, xlab="", cex.axis=0.7, main="Boxplots of logCPMs (normalised)")
+abline(h=median(logcounts_norm), col="blue")
+#Es pot observar que, efectivament, les dades s'han normalitzat.
+
+#Afegir la matriu de les dades normalitzades
+se_filtrat <- se_mostres[keep, ]
+assay(se_filtrat, "CPM") <- logcounts_norm
+
+#4
+library(factoextra)
+#Càlcul de matriu de distàncies
+sampleDists <- dist(t(logcounts_norm))
+sampleDists
+#Visualització de heatmap
+fviz_dist(sampleDists)
+#Dendrograma mitjançant el clustering jeràrquic
+plot(hclust(sampleDists),labels = colnames(logcounts_norm),main = "Dendogram of sample distances", cex.lab=0.8, cex.main=0.9)
+#Amb el dendograma es pot veure com la mostra 94478 és atípica, s'eliminarà
+logcounts_norm <- logcounts_norm[, !(colnames(logcounts_norm) %in% "94478")]
+
+#ESCALAMENT MULTIDIMENSIONAL (MDS)
+#Colorejar les mostres per gènere
+colData(se_filtrat)$gender <- factor(colData(se_filtrat)$gender)
+col.status <- c("blue","red")[colData(se_filtrat)$gender]
+data.frame(colData(se_filtrat)$gender,col.status)
+pch.status<-as.numeric(factor(colData(se_filtrat)$cohort))
+data.frame(colData(se_filtrat)$cohort,as.numeric(factor(colData(se_filtrat)$cohort)))
+#healthy=creu COVID=triangle Bacterial=cercle
+#Gràfic per gènere 
+limma::plotMDS(logcounts_norm,col=col.status, pch=pch.status)
+#Per gènere no hi ha diferències
+
+#Colorejar les mostres per raça
+colData(se_filtrat)$race <- factor(colData(se_filtrat)$race)
+col.status <- c("blue","red","dark green", "green", "orange")[colData(se_filtrat)$race]
+data.frame(colData(se_filtrat)$race,col.status)
+#Gràfic per raça 
+limma::plotMDS(logcounts_norm,col=col.status, pch=pch.status)
+#Molts casos de COVID son raça White i molts Bacterial son Black_African_American, podria ser una variable confusora.
+
+#Colorejar les mostres per temps
+colData(se_filtrat)
+colData(se_filtrat)$time_since_onset <- factor(colData(se_filtrat)$time_since_onset)
+col.status <- c("blue","red","dark green")[colData(se_filtrat)$time_since_onset]
+data.frame(colData(se_filtrat)$time_since_onset,col.status)
+#Gràfic per temps 
+limma::plotMDS(logcounts_norm,col=col.status, pch=pch.status)
+#Sí que hi ha diferències, el grup early de COVID es troba a la dreat del gràfic, podria ser una variable confusora.
+
+#Colorejar les mostres per grups d'edat
+colData(se_filtrat)$age2 <- cut(colData(se_filtrat)$age, 
+                                breaks = c(18, 40, 60, 80, Inf), 
+                                labels = c("18-40", "40-60", "60-80", "80+"), 
+                                right = FALSE) 
+col.status <- c("blue", "red", "dark green", "green")[colData(se_filtrat)$age2]
+data.frame(colData(se_filtrat)$age2, col.status)
+#Gràfic per grups d'edat
+limma::plotMDS(logcounts_norm,col=col.status, pch=pch.status)
+#Per grups d'edat no hi ha diferències
+
+#5
+set.seed(myseed) 
+sample(c("edgeR", "voom+limma", "DESeq2"), size = 1)
+
+library("DESeq2")
+#Matriu de disseny amb cohort, raça i temps
+ddsMat <- DESeqDataSetFromMatrix(countData = assay(se_filtrat),
+                                 colData = colData(se_filtrat),
+                                 design = ~ cohort + race)
+ddsMat <- DESeq(ddsMat)
+
+#Matrius de contrastos i anàlisi d'expressió diferencial Bacterial vs healthy 
+res1 <- results(ddsMat, contrast=c("cohort","Bacterial","healthy"))
+mcols(res1, use.names = TRUE)
+summary(res1)
+#Filtrar per padj
+res.05.1 <- results(ddsMat, contrast = c("cohort","Bacterial","healthy"), alpha = 0.05)
+table(res.05.1$padj < 0.05)
+#Filtrar per log2FC
+resLFC1.1 <- results(ddsMat, contrast = c("cohort","Bacterial","healthy"), lfcThreshold=1.5)
+table(resLFC1.1$padj < 0.1)
+
+#Matrius de contrastos i anàlisi d'expressió diferencial COVID_19 vs healthy 
+res <- results(ddsMat, contrast=c("cohort","COVID_19","healthy"))
+mcols(res, use.names = TRUE)
+summary(res)
+#Filtrar per padj
+res.05 <- results(ddsMat, contrast=c("cohort","COVID_19","healthy"), alpha = 0.05)
+table(res.05$padj < 0.05)
+#Filtrar per log2FC
+resLFC1 <- results(ddsMat, contrast=c("cohort","COVID_19","healthy"), lfcThreshold=1.5)
+table(resLFC1$padj < 0.1)
+
+#7
+#Otenció del gens
+sig_bact <- rownames(res1)[which(res$log2FoldChange > 1.5 & res1$padj < 0.05)]
+sig_covid <- rownames(res)[which(res$log2FoldChange > 1.5 & res$padj < 0.05)]
+library(VennDiagram)
+#Diagrama de Venn
+venn <- venn.diagram(
+  x = list(
+    Bacterial = sig_bact,
+    COVID19 = sig_covid
+  ),
+  category.names = c("Bacterial", "COVID_19"),
+  filename = NULL
+)
+grid.draw(venn)
+
+#8
+library(clusterProfiler)
+library(org.Hs.eg.db)
+#Obtenir ENTREZID
+sig_covid_entrez <- bitr(sig_covid, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+#Anàlisi d'enriquiment de funcions biològiques
+ego <- enrichGO(gene = sig_covid_entrez$ENTREZID, 
+                universe = allEntrezs,
+                keyType = "ENTREZID",
+                OrgDb = org.Hs.eg.db,  
+                ont = "BP", 
+                pAdjustMethod = "BH", 
+                qvalueCutoff = 0.05, 
+                readable = TRUE)
+
